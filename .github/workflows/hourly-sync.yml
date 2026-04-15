@@ -1,0 +1,32 @@
+name: Hourly Upstream Sync
+
+permissions:
+  contents: write
+
+on:
+  schedule:
+    - cron: "0 * * * *" # Runs every hour
+  workflow_dispatch:    # Allows manual trigger
+
+jobs:
+  sync_with_upstream:
+    runs-on: ubuntu-latest
+    name: Sync main with Upstream
+
+    steps:
+      - name: Checkout target branch
+        uses: actions/checkout@v3
+
+      - name: Sync Upstream
+        uses: aormsby/Fork-Sync-With-Upstream-action@v3.4
+        with:
+          target_sync_branch: main
+          # REQUIRED: The upstream repo you are syncing FROM
+          upstream_sync_repo: NousResearch/hermes-agent
+          upstream_sync_branch: main
+          
+          # REQUIRED: This token allows the action to push to your repo
+          target_repo_token: ${{ secrets.GITHUB_TOKEN }}
+          
+          # Set to 'false' to actually perform the sync
+          test_mode: false
