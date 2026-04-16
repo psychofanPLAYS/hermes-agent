@@ -2103,6 +2103,59 @@ class AIAgent:
         content = re.sub(r'</?(?:think|thinking|reasoning|thought|REASONING_SCRATCHPAD)>\s*', '', content, flags=re.IGNORECASE)
         return content
 
+    @staticmethod
+    def _has_natural_response_ending(content: str) -> bool:
+        """Heuristic: does visible assistant text look intentionally finished?"""
+        if not content:
+            return False
+        stripped = content.rstrip()
+        if not stripped:
+            return False
+        if stripped.endswith("```"):
+            return True
+        return stripped[-1] in '.!?:)"\']}。！？：）】」』》'
+
+    def _is_ollama_glm_backend(self) -> bool:
+        """Detect the narrow backend family affected by Ollama/GLM stop misreports."""
+        model_lower = (self.model or "").lower()
+        provider_lower = (self.provider or "").lower()
+        if "glm" not in model_lower and provider_lower != "zai":
+            return False
+        if "ollama" in self._base_url_lower or ":11434" in self._base_url_lower:
+            return True
+        return bool(self.base_url and is_local_endpoint(self.base_url))
+
+    def _should_treat_stop_as_truncated(
+        self,
+        finish_reason: str,
+        assistant_message,
+        messages: Optional[list] = None,
+    ) -> bool:
+        """Detect conservative stop->length misreports for Ollama-hosted GLM models."""
+        if finish_reason != "stop" or self.api_mode != "chat_completions":
+            return False
+        if not self._is_ollama_glm_backend():
+            return False
+        if not any(
+            isinstance(msg, dict) and msg.get("role") == "tool"
+            for msg in (messages or [])
+        ):
+            return False
+        if assistant_message is None or getattr(assistant_message, "tool_calls", None):
+            return False
+
+        content = getattr(assistant_message, "content", None)
+        if not isinstance(content, str):
+            return False
+
+        visible_text = self._strip_think_blocks(content).strip()
+        if not visible_text:
+            return False
+        if len(visible_text) < 20 or not re.search(r"\s", visible_text):
+            return False
+
+        return not self._has_natural_response_ending(visible_text)
+
     def _looks_like_codex_intermediate_ack(
         self,
         user_message: str,
@@ -6635,6 +6688,18 @@ class AIAgent:
             options["num_ctx"] = self._ollama_num_ctx
             extra_body["options"] = options
 
+        # Ollama / custom provider: pass think=false when reasoning is disabled.
+        # Ollama does not recognise the OpenRouter-style `reasoning` extra_body
+        # field, so we use its native `think` parameter instead.
+        # This prevents thinking-capable models (Qwen3, etc.) from generating
+        # <think> blocks and producing empty-response errors when the user has
+        # set reasoning_effort: none.
+        if self.provider == "custom" and self.reasoning_config and isinstance(self.reasoning_config, dict):
+            _effort = (self.reasoning_config.get("effort") or "").strip().lower()
+            _enabled = self.reasoning_config.get("enabled", True)
+            if _effort == "none" or _enabled is False:
+                extra_body["think"] = False
+
         if self._is_qwen_portal():
             extra_body["vl_high_resolution_images"] = True
 
@@ -6757,9 +6822,16 @@ class AIAgent:
                 except Exception:
                     pass
 
+        # Sanitize surrogates from API response — some models (e.g. Kimi/GLM via Ollama)
+        # can return invalid surrogate code points that crash json.dumps() on persist.
+        _raw_content = assistant_message.content or ""
+        _san_content = _sanitize_surrogates(_raw_content)
+        if reasoning_text:
+            reasoning_text = _sanitize_surrogates(reasoning_text)
+
         msg = {
             "role": "assistant",
-            "content": assistant_message.content or "",
+            "content": _san_content,
             "reasoning": reasoning_text,
             "finish_reason": finish_reason,
         }
@@ -7418,7 +7490,7 @@ class AIAgent:
         # Start spinner for CLI mode (skip when TUI handles tool progress)
         spinner = None
         if self._should_emit_quiet_tool_messages() and self._should_start_quiet_spinner():
-            face = random.choice(KawaiiSpinner.KAWAII_WAITING)
+            face = random.choice(KawaiiSpinner.get_waiting_faces())
             spinner = KawaiiSpinner(f"{face} ⚡ running {num_tools} tools concurrently", spinner_type='dots', print_fn=self._print_fn)
             spinner.start()
 
@@ -7714,7 +7786,7 @@ class AIAgent:
                     spinner_label = f"🔀 {goal_preview}" if goal_preview else "🔀 delegating"
                 spinner = None
                 if self._should_emit_quiet_tool_messages() and self._should_start_quiet_spinner():
-                    face = random.choice(KawaiiSpinner.KAWAII_WAITING)
+                    face = random.choice(KawaiiSpinner.get_waiting_faces())
                     spinner = KawaiiSpinner(f"{face} {spinner_label}", spinner_type='dots', print_fn=self._print_fn)
                     spinner.start()
                 self._delegate_spinner = spinner
@@ -7741,7 +7813,7 @@ class AIAgent:
                 # Context engine tools (lcm_grep, lcm_describe, lcm_expand, etc.)
                 spinner = None
                 if self.quiet_mode and not self.tool_progress_callback:
-                    face = random.choice(KawaiiSpinner.KAWAII_WAITING)
+                    face = random.choice(KawaiiSpinner.get_waiting_faces())
                     emoji = _get_tool_emoji(function_name)
                     preview = _build_tool_preview(function_name, function_args) or function_name
                     spinner = KawaiiSpinner(f"{face} {emoji} {preview}", spinner_type='dots', print_fn=self._print_fn)
@@ -7765,7 +7837,7 @@ class AIAgent:
                 # These are not in the tool registry — route through MemoryManager.
                 spinner = None
                 if self._should_emit_quiet_tool_messages() and self._should_start_quiet_spinner():
-                    face = random.choice(KawaiiSpinner.KAWAII_WAITING)
+                    face = random.choice(KawaiiSpinner.get_waiting_faces())
                     emoji = _get_tool_emoji(function_name)
                     preview = _build_tool_preview(function_name, function_args) or function_name
                     spinner = KawaiiSpinner(f"{face} {emoji} {preview}", spinner_type='dots', print_fn=self._print_fn)
@@ -7787,7 +7859,7 @@ class AIAgent:
             elif self.quiet_mode:
                 spinner = None
                 if self._should_emit_quiet_tool_messages() and self._should_start_quiet_spinner():
-                    face = random.choice(KawaiiSpinner.KAWAII_WAITING)
+                    face = random.choice(KawaiiSpinner.get_waiting_faces())
                     emoji = _get_tool_emoji(function_name)
                     preview = _build_tool_preview(function_name, function_args) or function_name
                     spinner = KawaiiSpinner(f"{face} {emoji} {preview}", spinner_type='dots', print_fn=self._print_fn)
@@ -8640,6 +8712,12 @@ class AIAgent:
                     new_tcs.append(tc)
                 am["tool_calls"] = new_tcs
 
+            # Proactively strip any surrogate characters before the API call.
+            # Models served via Ollama (Kimi K2.5, GLM-5, Qwen) can return
+            # lone surrogates (U+D800-U+DFFF) that crash json.dumps() inside
+            # the OpenAI SDK. Sanitizing here prevents the 3-retry cycle.
+            _sanitize_messages_surrogates(api_messages)
+
             # Calculate approximate request size for logging
             total_chars = sum(len(str(msg)) for msg in api_messages)
             approx_tokens = estimate_messages_tokens_rough(api_messages)
@@ -8653,8 +8731,8 @@ class AIAgent:
                 self._vprint(f"{self.log_prefix}   🔧 Available tools: {len(self.tools) if self.tools else 0}")
             else:
                 # Animated thinking spinner in quiet mode
-                face = random.choice(KawaiiSpinner.KAWAII_THINKING)
-                verb = random.choice(KawaiiSpinner.THINKING_VERBS)
+                face = random.choice(KawaiiSpinner.get_thinking_faces())
+                verb = random.choice(KawaiiSpinner.get_thinking_verbs())
                 if self.thinking_callback:
                     # CLI TUI mode: use prompt_toolkit widget instead of raw spinner
                     # (works in both streaming and non-streaming modes)
@@ -9038,6 +9116,17 @@ class AIAgent:
                         finish_reason = stop_reason_map.get(response.stop_reason, "stop")
                     else:
                         finish_reason = response.choices[0].finish_reason
+                        assistant_message = response.choices[0].message
+                        if self._should_treat_stop_as_truncated(
+                            finish_reason,
+                            assistant_message,
+                            messages,
+                        ):
+                            self._vprint(
+                                f"{self.log_prefix}⚠️  Treating suspicious Ollama/GLM stop response as truncated",
+                                force=True,
+                            )
+                            finish_reason = "length"
 
                     if finish_reason == "length":
                         self._vprint(f"{self.log_prefix}⚠️  Response truncated (finish_reason='length') - model hit max output tokens", force=True)
